@@ -1,123 +1,101 @@
-import flickrapi
-import urllib
-from boto.s3.key import Key
-from boto.s3 import Connection
 import os
-import sys
+import webbrowser
+
+import boto3
+import flickrapi
+import requests
+import unidecode
 
 # SETTABLE PARAMETERS
 flickr_api_key = os.environ['FLICKR_KEY']
 flickr_api_secret = os.environ['FLICKR_SECRET']
-
-s3_access_key = os.environ['S3_KEY']
-s3_secret_key = os.environ['S3_SECRET']
-bucket = os.environ['FLICKR_BUCKET']
 flickr_url = os.environ['FLICKR_URL']
+bucket = os.environ['FLICKR_BUCKET']
+s3_region = os.environ['S3_REGION']
+storage_class = os.environ.get('S3_STORAGE_CLASS', 'STANDARD_IA')
+if 'S3_PATH' in os.environ:
+    s3_path = '{}/'.format(os.environ['S3_PATH'])
+else:
+    s3_path = ''
 
-class LineOutput:
-    last = 0
-    out = sys.stdout
 
-    def _message(self, msg):
-        if self.out.isatty():
-            self.out.write("\r")
-            self.out.write(msg)
-            if len(msg) < self.last:
-                i = self.last - len(msg)
-                self.out.write(" " * i + "\b" * i)
-            self.out.flush()
-            self.lastMessage = msg
-            self.last = len(msg)
-
-    def __del__(self):
-        if self.last:
-            self._message("")
-            print >> self.out, "\r",
-            self.out.flush()
-
-    def __init__(self, f = sys.stdout):
-        self.last = 0
-        self.lastMessage = ''
-        self.out = f
-
-def makeBotoCallback():
-    c = LineOutput()
-    def callbackFunc(sent, total):
-        c._message("Uploading: %.2f%% (%d/%d)\r" % ((float(sent)/float(total))*100.0, sent, total))
-
-    return callbackFunc
-    
-def makeFlickrCallback():
-    c = LineOutput()
-    def callbackFunc(blocks, blockSize, total):
-        sent = blocks * blockSize
-        c._message("Downloading: %.2f%% (%d/%d)\r" % ((float(sent)/float(total))*100.0, sent, total))
-
-    return callbackFunc
-
-def addPhoto(photo):
+def addPhoto(photo, photoset=None):
+    client = boto3.client('s3')
     url = flickr.photos_getSizes(photo_id = photo.attrib['id'])
     realUrl = None
     for url in url.find('sizes').findall('size'):
-        if url.attrib['label'] == "Original":
+        if url.attrib['label'] == 'Original':
             realUrl = url.attrib['source']
 
     if realUrl:
-        keyId = photo.attrib['id'] + ".jpg"
-        dataKeyId = keyId + ".metadata"
+        keyId = '{}{}.jpg'.format(s3_path, photo.attrib['id'])
+        dataKeyId = '{}.metadata'.format(keyId)
 
         # Upload photo
-        if bucket.get_key(keyId) is None:
-            print "%s not found on S3; uploading" % keyId
-            f, h = urllib.urlretrieve(realUrl, reporthook = makeFlickrCallback())
-            key = Key(bucket)
-            key.key = keyId
+        objects = client.list_objects(Bucket=bucket, Prefix=keyId)
+        if 'Contents' not in objects or len(objects['Contents']) == 0:
+            print('{} not found on S3; uploading'.format(keyId))
+            response = requests.get(realUrl)
+            assert response.status_code == 200
 
-
-            print "Uploading %s to %s/%s" % (photo.attrib['title'], bucket.name, key.key)
-            key.set_metadata('flickrInfo', key.key + ".metadata")
-            key.set_metadata('inFlickrSet', set.attrib['id'])
-            key.set_contents_from_filename(f, cb = makeBotoCallback())
-            os.unlink(f)
+            print('Uploading "{}" to {}/{}'.format(photo.attrib['title'], bucket, keyId))
+            metadata = {
+                'flickrInfo': dataKeyId,
+            }
+            if photoset is not None:
+                metadata['inFlickrSet'] = photoset.attrib['id']
+                metadata['inFlickrSetTitle'] = unidecode.unidecode(photoset.find('title').text)
+                if photoset.find('description').text is not None:
+                    metadata['inFlickrSetDescription'] = unidecode.unidecode(photoset.find('description').text)
+            client.put_object(Body=response.content, Bucket=bucket, Key=keyId, Metadata=metadata, StorageClass=storage_class)
 
         # Upload metadata
-        if bucket.get_key(dataKeyId) is None:
-            print "%s not found on S3, setting metadata" % dataKeyId
-            photoInfo = flickr.photos_getInfo(photo_id = photo.attrib['id'], format = "rest")
-            key = Key(bucket)
-            key.key = dataKeyId
-            key.set_contents_from_string(photoInfo) 
+        objects = client.list_objects(Bucket=bucket, Prefix=dataKeyId)
+        if 'Contents' not in objects or len(objects['Contents']) == 0:
+            print('{} not found on S3, setting metadata'.format(dataKeyId))
+            photoInfo = flickr.photos_getInfo(photo_id = photo.attrib['id'], format = 'rest')
+            client.put_object(Body=photoInfo, Bucket=bucket, Key=dataKeyId, StorageClass=storage_class)
 
-print "Establishing S3 connection..."
-s3conn = Connection(s3_access_key, s3_secret_key)
-buckets = s3conn.get_all_buckets()
-if bucket not in [x.name for x in buckets]:
-    print "Bucket not found, creating..."
-    s3conn.create_bucket(bucket)
-bucket = s3conn.get_bucket(bucket)
 
-flickr = flickrapi.FlickrAPI(flickr_api_key, flickr_api_secret)
+if __name__ == '__main__':
+    print('Establishing S3 connection...')
+    client = boto3.client('s3')
+    buckets = client.list_buckets()
 
-(token, frob) = flickr.get_token_part_one(perms='write')
-if not token: raw_input("Press ENTER after you authorized this program")
-flickr.get_token_part_two((token, frob))
+    if bucket not in [x['Name'] for x in buckets['Buckets']]:
+        print('Bucket not found, creating...')
+        create_bucket_configuration = {
+            'LocationConstraint': s3_region,
+        }
+        response = client.create_bucket(Bucket=bucket, CreateBucketConfiguration=create_bucket_configuration)
 
-userIdResponse = flickr.urls_lookupUser(url = flickr_url)
-userId = userIdResponse.find('user').attrib['id']
+    flickr = flickrapi.FlickrAPI(flickr_api_key, flickr_api_secret)
 
-sets = flickr.photosets_getList(user_id=userId).find('photosets')
-for set in sets.findall('photoset'):
-    print "Found set: ", set.find("title").text
-    print "Fetching photos...",
-    photos = flickr.photosets_getPhotos(photoset_id = set.attrib['id']).find('photoset')
-    print photos.attrib['total'], "found"
+    if not flickr.token_valid(perms='write'):
+        flickr.get_request_token(oauth_callback='oob')
 
-    for photo in photos.findall('photo'):
+        authorize_url = flickr.auth_url(perms='write')
+        webbrowser.open_new_tab(authorize_url)
+
+        verifier = str(input('Verifier code: '))
+        flickr.get_access_token(verifier)
+
+    userIdResponse = flickr.urls_lookupUser(url = flickr_url)
+    userId = userIdResponse.find('user').attrib['id']
+
+    photosets = flickr.photosets_getList(user_id=userId).find('photosets')
+    for photoset in photosets.findall('photoset'):
+        print('Found set:', photoset.find('title').text)
+        print('Fetching photos...')
+        photos = flickr.photosets_getPhotos(photoset_id = photoset.attrib['id']).find('photoset')
+        print(photos.attrib['total'], 'found')
+
+        for photo in photos.findall('photo'):
+            addPhoto(photo, photoset)
+
+    # add photos out of sets
+    print('Transferring photos outside of any set...')
+    photos = flickr.photos_getNotInSet().find('photos')
+    for photo in photos:
         addPhoto(photo)
-
-# add photos out of sets
-print "Transferring photos outside of any set..."
-photos = flickr.photos_getNotInSet().find('photos')
-for photo in photos:
-    addPhoto(photo)
 
